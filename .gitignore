@@ -52,3 +52,7 @@ lib/generated/
 
 # Reminder email previews (dev, no Resend key)
 /.email-previews
+
+# Private: product rules and implementation prompts (kept local only)
+/AGENTS.md
+/prompts/

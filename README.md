@@ -1,6 +1,6 @@
 # Vappi
 
-Students upload their own course files; AI turns them into summaries, flashcards, quizzes and a day-by-day plan until the exam. See `AGENTS.md` for the product rules and `prompts/` for every implemented change.
+Vappi is your AI pal for your own files: upload anything to a Space, then learn it (summaries, flashcards, quizzes), ask it (chat with cited pages), or make something from it.
 
 ## Stack
 
