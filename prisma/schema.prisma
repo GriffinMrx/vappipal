@@ -1,0 +1,476 @@
+// Vappi database schema (Neon Postgres).
+// Connection URLs live in prisma.config.ts (CLI, direct) and lib/db.ts (app, pooled).
+// pgvector is enabled in the first migration (CREATE EXTENSION IF NOT EXISTS vector).
+// Every row carries a userId (directly or via its parent) so every query can be
+// scoped to the signed-in Clerk user (AGENTS.md §5).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ──────────────────────────────────────────────────────────────────
+
+enum Plan {
+  FREE
+  PRO
+}
+
+enum SpaceColor {
+  SLATE
+  BLUE
+  VIOLET
+  PINK
+  RED
+  ORANGE
+  GREEN
+  TEAL
+
+  @@map("SubjectColor")
+}
+
+enum FileType {
+  PDF
+  PPTX
+  DOCX
+  IMAGE
+}
+
+enum DocumentStatus {
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum QuestionType {
+  MULTIPLE_CHOICE
+  SHORT_ANSWER
+}
+
+enum SubscriptionKind {
+  SUBSCRIPTION // Pro monthly / yearly
+  PASS         @map("EXAM_PASS") // 30-Day Pass: one-time order, Pro for 30 days
+}
+
+/// Lemon Squeezy subscription / order statuses.
+enum SubscriptionStatus {
+  ON_TRIAL
+  ACTIVE
+  PAUSED
+  PAST_DUE
+  UNPAID
+  CANCELLED
+  EXPIRED
+  PAID // 30-Day Pass order paid
+  REFUNDED
+}
+
+enum UsageKind {
+  QUIZ
+  CHAT // a chat message sent (hourly limit; survives clearing the chat)
+  REGENERATE // a chat answer regenerated (hourly limit)
+  CREATION // a new creation (weekly free limit; deleting doesn't give it back)
+  CREATE_EDIT // an AI edit of a creation (hourly limit)
+}
+
+/// One stage of the processing pipeline (each runs as its own job step).
+enum DocumentStepKind {
+  EXTRACT
+  EMBED
+  SUMMARY
+  FLASHCARDS
+  QUIZ
+}
+
+enum StepStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+}
+
+enum CreationType {
+  NOTES
+  OUTLINE
+  CHECKLIST
+  EMAIL
+  BLOG_POST
+}
+
+enum CreationStatus {
+  WRITING
+  READY
+  FAILED
+}
+
+enum ChatRole {
+  USER
+  ASSISTANT
+}
+
+enum WebhookSource {
+  CLERK
+  LEMON_SQUEEZY
+}
+
+// ─── Models ─────────────────────────────────────────────────────────────────
+
+/// A user. Keyed by the Clerk user id; created by the Clerk webhook.
+model User {
+  id                     String    @id // Clerk user id (user_…)
+  email                  String    @unique
+  name                   String?
+  /// IANA time zone so "today" is the user's day. Synced from the browser.
+  timeZone               String    @default("UTC")
+  plan                   Plan      @default(FREE)
+  /// Daily reminder email opt-out (every email also has an unsubscribe link).
+  emailReminders         Boolean   @default(true)
+  /// How fast Vappi types in the Create editor (Settings).
+  writingSpeed           WritingSpeed @default(NORMAL)
+  /// Student's calendar day the last reminder was sent (one per day).
+  lastReminderOn         DateTime? @db.Date
+  /// When the welcome email was claimed/sent (once per account; null = not yet).
+  welcomeEmailAt         DateTime?
+  /// Random token for the one-click unsubscribe link (only turns reminders off).
+  unsubscribeToken       String    @unique @default(cuid())
+  /// Lemon Squeezy customer, for the customer portal. Written by the billing webhook.
+  lemonSqueezyCustomerId String?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  spaces        Space[]
+  documents     Document[]
+  chunks        Chunk[]
+  flashcards    Flashcard[]
+  questions     Question[]
+  attempts      Attempt[]
+  planDays      PlanDay[]
+  subscriptions Subscription[]
+  usageEvents   UsageEvent[]
+  chatMessages  ChatMessage[]
+  creations     Creation[]
+}
+
+/// A Space: groups the user's files about one topic.
+model Space {
+  id        String     @id @default(cuid())
+  userId    String
+  name      String
+  /// Goal day (calendar date, no time), e.g. an exam or a presentation.
+  goalDate  DateTime?  @map("examDate") @db.Date
+  /// What the goal is ("Exam", "Presentation", "Deadline", …). Optional.
+  goalLabel String?
+  color     SpaceColor @default(BLUE)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documents    Document[]
+  chunks       Chunk[]
+  flashcards   Flashcard[]
+  questions    Question[]
+  planDays     PlanDay[]
+  chatMessages ChatMessage[]
+  creations    Creation[]
+
+  @@index([userId])
+  @@map("Subject")
+}
+
+/// An uploaded file. The file itself lives in private storage.
+model Document {
+  id             String         @id @default(cuid())
+  spaceId        String         @map("subjectId")
+  userId         String
+  /// Original file name (never sent to analytics).
+  title          String
+  /// Private storage key — never a public URL; opened via short-lived signed URLs.
+  fileKey        String
+  fileType       FileType
+  mimeType       String
+  sizeBytes      Int
+  status         DocumentStatus @default(PROCESSING)
+  failureReason  String?
+  pageCount      Int?
+  /// Pages extracted so far (progress while processing in page batches).
+  pagesProcessed Int            @default(0)
+  /// True when any page needed OCR (scanned PDF or photo).
+  ocrUsed        Boolean        @default(false)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  space      Space          @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  chunks     Chunk[]
+  summary    Summary?
+  flashcards Flashcard[]
+  questions  Question[]
+  steps      DocumentStep[]
+
+  @@index([userId])
+  @@index([spaceId])
+}
+
+/// Status of one pipeline step for one document, so a failed step can be
+/// shown and retried on its own (AGENTS.md §7, §9).
+model DocumentStep {
+  id         String           @id @default(cuid())
+  documentId String
+  step       DocumentStepKind
+  status     StepStatus       @default(PENDING)
+  /// Short, user-safe reason (never raw document text).
+  error      String?
+  attempts   Int              @default(0)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, step])
+}
+
+/// A small piece of a document's text, with its page and embedding.
+model Chunk {
+  id             String                       @id @default(cuid())
+  documentId     String
+  /// userId + spaceId are denormalised so vector search always filters by both.
+  userId         String
+  spaceId        String                       @map("subjectId")
+  page           Int
+  /// Order within the document; unique so job retries can't duplicate chunks.
+  index          Int
+  text           String
+  /// Embedding size is fixed by the embedding model (1536). Changing it = re-embed.
+  embedding      Unsupported("vector(1536)")?
+  /// Model that produced `embedding` (e.g. "gemini-embedding-2", "mock-hash").
+  /// Search only compares vectors from the current model; others get re-embedded.
+  embeddingModel String?
+  createdAt      DateTime                     @default(now())
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  space    Space    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  // HNSW index "Chunk_embedding_hnsw_idx" (vector_cosine_ops) is created in raw SQL
+  // in the `foundations` migration. Prisma can't model HNSW, so every NEW migration
+  // it generates will contain `DROP INDEX "Chunk_embedding_hnsw_idx";` —
+  // DELETE THAT LINE before applying, or chat search loses its index.
+
+  @@unique([documentId, index])
+  @@index([userId, spaceId])
+  @@index([documentId, embeddingModel])
+}
+
+/// Short and long summary of one document, with key terms to highlight.
+model Summary {
+  id         String   @id @default(cuid())
+  documentId String   @unique
+  short      String
+  long       String
+  keyTerms   String[]
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+}
+
+/// A flashcard with SM-2 spaced-repetition state.
+model Flashcard {
+  id             String    @id @default(cuid())
+  spaceId        String    @map("subjectId")
+  documentId     String
+  userId         String
+  front          String
+  back           String
+  /// Page in the source document (the UI opens it).
+  sourcePage     Int
+  ease           Float     @default(2.5)
+  intervalDays   Int       @default(0)
+  repetitions    Int       @default(0)
+  nextReviewAt   DateTime  @default(now())
+  lastReviewedAt DateTime?
+  /// Times the card was graded "Again" after being learned.
+  lapses         Int       @default(0)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  space    Space    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, nextReviewAt])
+  @@index([spaceId, nextReviewAt])
+  @@index([documentId])
+}
+
+/// A quiz question (multiple choice graded by code, short answer by AI).
+model Question {
+  id          String       @id @default(cuid())
+  spaceId     String       @map("subjectId")
+  documentId  String
+  userId      String
+  type        QuestionType
+  question    String
+  /// Choices for MULTIPLE_CHOICE (empty for SHORT_ANSWER).
+  options     String[]
+  answer      String
+  explanation String
+  sourcePage  Int
+  createdAt   DateTime     @default(now())
+
+  space    Space     @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  document Document  @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  attempts Attempt[]
+
+  @@index([spaceId])
+  @@index([documentId])
+  @@index([userId])
+}
+
+/// One answer to one question.
+model Attempt {
+  id         String   @id @default(cuid())
+  userId     String
+  questionId String
+  answer     String?
+  correct    Boolean
+  /// AI grader's short note for short answers.
+  feedback   String?
+  createdAt  DateTime @default(now())
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([questionId])
+}
+
+/// One day of a space's goal plan (built by plain code, not AI).
+model PlanDay {
+  id        String   @id @default(cuid())
+  spaceId   String   @map("subjectId")
+  userId    String
+  /// Calendar day in the user's time zone.
+  date      DateTime @db.Date
+  /// { review, tasks: [{ id, kind: "read" | "cards" | "quiz", documentId?, title?, count?, done }] }
+  tasks     Json
+  done      Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([spaceId, date])
+  @@index([userId, date])
+  @@map("StudyPlanDay")
+}
+
+/// A Lemon Squeezy subscription (Pro) or one-time order (30-Day Pass).
+/// Only the billing webhook writes here.
+model Subscription {
+  id             String             @id @default(cuid())
+  userId         String
+  /// Lemon Squeezy subscription id or order id.
+  lemonSqueezyId String             @unique
+  kind           SubscriptionKind
+  variantId      String
+  status         SubscriptionStatus
+  /// Lemon Squeezy test-mode row; never counted when the app runs live.
+  testMode       Boolean            @default(false)
+  renewsAt       DateTime?
+  /// Subscription end, or 30-Day Pass expiry (purchase + 30 days).
+  endsAt         DateTime?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Smallest usage tracking: quizzes taken (weekly free limit), chat sends and
+/// regenerates (hourly cost limits).
+/// Documents and flashcards are counted from their own tables.
+model UsageEvent {
+  id        String    @id @default(cuid())
+  userId    String
+  kind      UsageKind
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, kind, createdAt])
+}
+
+/// One chat message in a space. Assistant messages carry the pages they cite.
+model ChatMessage {
+  id        String   @id @default(cuid())
+  userId    String
+  spaceId   String   @map("subjectId")
+  role      ChatRole
+  content   String
+  /// [{ documentId, page }] — pages the answer used (empty for USER).
+  citations Json     @default("[]")
+  /// Client-generated id of an optimistic send, so a retry can't duplicate it.
+  clientId  String?
+  createdAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, clientId])
+  @@index([spaceId, createdAt])
+}
+
+/// Webhook deliveries already handled (Clerk and Lemon Squeezy retry).
+model WebhookEvent {
+  id         String        @id @default(cuid())
+  source     WebhookSource
+  eventId    String
+  receivedAt DateTime      @default(now())
+
+  @@unique([source, eventId])
+}
+
+/// Something made from a Space's files (Create mode). Content is the editor's
+/// JSON document (never raw HTML); sources are the pages it was made from.
+model Creation {
+  id          String         @id @default(cuid())
+  userId      String
+  spaceId     String
+  type        CreationType
+  title       String
+  /// One emoji shown above the title.
+  icon        String?
+  /// One of the design-token gradients (see lib/creations/types.ts), or null.
+  banner      String?
+  /// The user's optional instruction ("for my manager", "keep it short").
+  instruction String?
+  /// Tiptap/ProseMirror JSON document.
+  content     Json?
+  /// The Markdown the AI wrote (kept until the editor document exists).
+  markdown    String?
+  /// [{ documentId, page }]
+  sources     Json           @default("[]")
+  status      CreationStatus @default(WRITING)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+
+  @@index([userId, spaceId, updatedAt])
+}
+
+/// Vappi's typing pace in the Create editor.
+enum WritingSpeed {
+  CALM
+  NORMAL
+  FAST
+  INSTANT
+}
